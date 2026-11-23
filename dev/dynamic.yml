@@ -1,0 +1,36 @@
+http:
+  routers:
+    demo:
+      rule: PathPrefix(`/`)
+      entryPoints:
+        - web
+      middlewares:
+        - threatdb
+      service: whoami
+
+  middlewares:
+    threatdb:
+      plugin:
+        threatdb:
+          # The real Threat.Live list contains almost 50k addresses.
+          refreshInterval: 15m
+          requestTimeout: 15s
+          statusPath: /_threatdb/status
+          logBlockedRequests: true
+
+          # DEMO ONLY: trusts X-Forwarded-For from whoever connects so that
+          # arbitrary client addresses can be simulated with curl. This also
+          # requires --entryPoints.web.forwardedHeaders.insecure=true (see
+          # docker-compose.yml). Never do this on an internet-facing instance.
+          trustedProxyDepth: 1
+
+          providers:
+            threatlive:
+              name: Threat.Live
+              url: https://list.threat.live
+
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: http://whoami:80

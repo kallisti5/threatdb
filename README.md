@@ -1,0 +1,363 @@
+# traefik-threatdb
+
+A [Traefik](https://traefik.io) middleware plugin that periodically downloads
+public "bad IP" lists and blocks requests from addresses that appear on them.
+Blocked clients get a friendly explanation instead of a bare 403.
+
+- Downloads lists **at startup and on a schedule**, never on the request path.
+- Matches IPv4 and IPv6 addresses, single IPs and CIDR ranges.
+- Keeps the last good copy when a provider is down, with retry/backoff.
+- Sends conditional requests (`If-None-Match` / `If-Modified-Since`) when the
+  provider supports them.
+- Zero third-party dependencies, so it runs cleanly under Yaegi.
+- Optional JSON status endpoint for operations.
+
+> The lists are third-party data. Shared addresses (CGNAT, VPNs, cloud egress,
+> mobile carriers) occasionally appear on them, so keep an `allowList` ready and
+> do not treat this middleware as your only security control.
+
+## How it works
+
+1. On construction, every configured provider is fetched and parsed in
+   parallel. Traefik starts serving only after these attempts finish (bounded by
+   `requestTimeout`).
+2. Each list is kept in memory as a hash set of addresses plus CIDR networks
+   bucketed by prefix length.
+3. A background goroutine refreshes each list on its own interval. Failed
+   refreshes are retried with exponential backoff (10s up to 5m), while the last
+   good copy keeps being used.
+4. On every request the client address is checked against the cached sets. Only
+   hash lookups are involved (benchmarked in the tens of nanoseconds), and the
+   upstream provider is never contacted.
+5. A match returns the configured status (default 403) with a message naming the
+   list, e.g.:
+
+   ```http
+   HTTP/1.1 403 Forbidden
+   Content-Type: text/plain; charset=utf-8
+   Cache-Control: no-store
+   X-Threat-List: Threat.Live
+
+   Your IP is present on the Threat.Live threat list. Please try again later
+   ```
+
+## Installation
+
+### From the plugin catalog
+
+Declare the plugin in Traefik's static configuration:
+
+```yaml
+# traefik.yml
+experimental:
+  plugins:
+    threatdb:
+      moduleName: github.com/kallisti5/threatdb
+      version: v0.1.0
+```
+
+Then use it from the dynamic configuration:
+
+```yaml
+# dynamic.yml
+http:
+  routers:
+    app:
+      rule: Host(`example.com`)
+      entryPoints:
+        - websecure
+      middlewares:
+        - threatdb
+      service: app
+
+  middlewares:
+    threatdb:
+      plugin:
+        threatdb:
+          providers:
+            threatlive:
+              name: Threat.Live
+              url: https://list.threat.live
+          # Optional: expose status at /_threatdb/status on this router.
+          statusPath: /_threatdb/status
+
+  services:
+    app:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:5000
+```
+
+### Local plugin mode
+
+For development, mount the repository as a local plugin:
+
+```yaml
+# traefik.yml
+experimental:
+  localPlugins:
+    threatdb:
+      moduleName: github.com/kallisti5/threatdb
+```
+
+The source must live in `./plugins-local/src/github.com/kallisti5/threatdb`.
+See [`dev/`](dev/) for a ready-to-run Docker Compose setup.
+
+## Configuration
+
+### Core options
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `providers` | map | *(required)* | Threat lists to download. See below. |
+| `refreshInterval` | duration | `15m` | How often each list is refreshed. |
+| `requestTimeout` | duration | `15s` | Timeout for one list download. Also bounds startup delay per provider. |
+| `maxListBytes` | int | `16777216` | Reject responses larger than this (16 MiB). |
+| `maxStale` | duration | `24h` | Age after which the status endpoint reports a list as stale. `0` disables the report. Stale lists are still enforced. |
+| `statusCode` | int | `403` | Status returned to blocked clients (200–599). |
+| `message` | string | see below | Block response body. Supports `{provider}` and `{ip}`. |
+| `unavailableMessage` | string | see below | Body used when `failClosed` is on and a list has not loaded. |
+| `contentType` | string | `text/plain; charset=utf-8` | `Content-Type` of block responses. |
+| `allowList` | list | `[]` | IPs or CIDRs that are never blocked (e.g. `203.0.113.4`, `2001:db8::/32`). |
+| `excludePrivateIPs` | bool | `false` | Let loopback, private, link-local, multicast and CGNAT addresses bypass the lists. |
+| `trustedProxyDepth` | int | `0` | Trust the last N hops of the forwarded header. `0` uses the TCP peer address. |
+| `forwardedForHeader` | string | `X-Forwarded-For` | Header used when `trustedProxyDepth > 0`. |
+| `failClosed` | bool | `false` | Return 503 while a list has never loaded instead of failing open. |
+| `statusPath` | string | *(disabled)* | Exact path that serves a JSON status document, bypassing blocking. |
+| `logBlockedRequests` | bool | `false` | Log each blocked request (can be noisy under attack). |
+| `userAgent` | string | `traefik-threatdb/<version>` | User-Agent sent to providers. |
+
+Default messages:
+
+```text
+Your IP is present on the {provider} threat list. Please try again later
+The {provider} threat list is temporarily unavailable. Please try again later
+```
+
+`{provider}` is replaced with the display name(s) of the matching list, joined
+with `, ` if several match. `{ip}` is the client address.
+
+### Provider options
+
+The key of each provider entry is a stable identifier used in logs. Provider
+entries are processed in sorted key order, which keeps messages deterministic.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `url` | string | *(required)* | Absolute `http` or `https` URL of the list. |
+| `name` | string | provider key | Display name used in messages and `X-Threat-List`. |
+| `refreshInterval` | duration | global value | Per-provider override. `0` fetches once at startup and never refreshes. |
+| `headers` | map | `{}` | Extra request headers, e.g. an API token. |
+| `minEntries` | int | `0` | Reject a download with fewer parsed entries, protecting against truncation or error pages. |
+| `maxListBytes` | int | global value | Per-provider size limit. |
+
+### Multiple providers
+
+```yaml
+http:
+  middlewares:
+    threatdb:
+      plugin:
+        threatdb:
+          providers:
+            threatlive:
+              name: Threat.Live
+              url: https://list.threat.live
+              refreshInterval: 15m
+
+            spamhaus-drop:
+              name: Spamhaus DROP
+              url: https://www.spamhaus.org/drop/drop.txt
+              refreshInterval: 1h
+              minEntries: 100
+
+            firehol1:
+              name: FireHOL level 1
+              url: https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset
+              refreshInterval: 1h
+              minEntries: 100
+```
+
+## Supported list formats
+
+Any text response containing addresses is accepted:
+
+- One entry per line, or several per line separated by spaces, tabs, commas or
+  pipes.
+- Plain addresses (`203.0.113.5`, `2001:db8::1`), `host:port` pairs, and CIDR
+  networks (`198.51.100.0/24`, `2001:db8::/32`).
+- Comments after `#` or `;`.
+- UTF-8 BOM and CRLF line endings.
+- IPv4-mapped IPv6 entries are normalised to IPv4.
+
+An empty result, an HTML error page, an oversized body, or a list smaller than
+`minEntries` is rejected and the previous copy is kept.
+
+## Client IP handling
+
+By default the plugin matches the TCP peer address (`RemoteAddr`). This is the
+safe choice for a Traefik instance on the public edge.
+
+When Traefik runs behind another proxy or CDN, set `trustedProxyDepth` to the
+number of proxies you control in front of it, **including the direct peer**:
+
+```yaml
+trustedProxyDepth: 2
+forwardedForHeader: X-Forwarded-For
+```
+
+With a header of `client, proxy1`, depth `2` selects `client`; depth `1` selects
+`proxy1`. If the header has fewer hops than requested, or contains something
+that is not an IP, the plugin falls back to the TCP peer address.
+
+Traefik v3 **strips incoming `X-Forwarded-*` headers from untrusted peers**
+before middleware runs, so the plugin will see an empty header unless the
+entrypoint trusts the peer. Configure the entrypoint as well:
+
+```yaml
+# static configuration
+entryPoints:
+  websecure:
+    address: ":443"
+    forwardedHeaders:
+      trustedIPs:
+        - 10.0.0.0/8      # your load balancer / proxy network
+        - 192.0.2.10/32   # or individual proxy addresses
+```
+
+`forwardedHeaders.insecure: true` also works but trusts every peer, so it is
+only appropriate for local experiments (the bundled dev setup uses it to make
+simulating client addresses easy).
+
+> **Security warning:** forwarded headers are trivially spoofed by clients.
+> Only enable `trustedProxyDepth` when every path to Traefik goes through
+> proxies that overwrite or append the header, and make sure Traefik itself is
+> not directly reachable. Misconfiguring this lets attackers choose an address
+> that is not on the lists.
+
+For Cloudflare, `CF-Connecting-IP` is usually the simplest header:
+
+```yaml
+trustedProxyDepth: 1
+forwardedForHeader: CF-Connecting-IP
+```
+
+Traefik does not strip that header, but you must still make sure your origin
+only accepts traffic from Cloudflare.
+
+## Availability behaviour
+
+- If a provider is down at startup, Traefik still starts and the plugin is
+  active. With the default `failClosed: false` requests are allowed until a list
+  loads; with `failClosed: true` they receive a 503 and
+  `unavailableMessage` until every list has been loaded at least once.
+- Once a list has loaded it is never discarded on a failed refresh. It keeps
+  blocking with the last known data, and the status endpoint reports the error.
+- Refreshes are retried with exponential backoff: 10s, 20s, 40s, ... capped at
+  5 minutes (or the provider's interval if that is shorter).
+- `maxStale` only affects reporting. It does not stop enforcement and does not
+  trigger `failClosed`, because stale data still contains real threat entries.
+
+## Status endpoint
+
+Set `statusPath` to a path that your application does not use. A `GET` returns:
+
+```json
+{
+  "middleware": "threatdb@file",
+  "version": "0.1.0",
+  "failClosed": false,
+  "blockStatusCode": 403,
+  "maxStaleSeconds": 86400,
+  "providers": [
+    {
+      "key": "threatlive",
+      "name": "Threat.Live",
+      "url": "https://list.threat.live",
+      "entries": 47365,
+      "loaded": true,
+      "stale": false,
+      "fetching": false,
+      "lastAttempt": "2026-11-23T16:20:03Z",
+      "lastSuccess": "2026-11-23T16:20:03Z",
+      "ageSeconds": 42,
+      "lastError": ""
+    }
+  ]
+}
+```
+
+The endpoint bypasses the block logic so it can be checked from anywhere the
+router is reachable. Restrict it with a dedicated router, a Traefik IP allowlist,
+or by not exposing it publicly.
+
+## Local development
+
+```bash
+docker compose -f dev/docker-compose.yml up
+```
+
+Then, in another terminal:
+
+```bash
+# Allowed request (plain 200 from whoami)
+curl -s http://localhost:8000/
+
+# Simulate a listed client (the dev config trusts X-Forwarded-For)
+curl -si http://localhost:8000/ -H 'X-Forwarded-For: 45.79.181.251'
+
+# Inspect the loaded lists
+curl -s http://localhost:8000/_threatdb/status | jq .
+```
+
+The Traefik dashboard is available at <http://localhost:8080>.
+
+`dev/dynamic.yml` uses `trustedProxyDepth: 1` on purpose so arbitrary client
+addresses can be simulated locally, and `dev/docker-compose.yml` enables
+`forwardedHeaders.insecure` so Traefik passes the header through. Do not copy
+either setting to production.
+
+## Testing
+
+```bash
+make test          # go test ./...
+make race          # go test -race ./...
+make yaegi-test    # run the tests under Yaegi, Traefik's interpreter
+make bench         # set lookup benchmark
+```
+
+The test suite covers list parsing, IPv4/IPv6/CIDR matching, client IP
+extraction, scheduling and refresh, conditional requests, stale-data retention,
+configuration validation, the status endpoint, and concurrent traffic during
+refreshes.
+
+## Publishing to the Traefik plugin catalog
+
+1. Publish this repository at the module path in [`go.mod`](go.mod). If your
+   repository lives elsewhere, update `module` in `go.mod`, `import` in
+   [`.traefik.yml`](.traefik.yml), and the paths in this README.
+2. Add the `traefik-plugin` topic to the GitHub repository.
+3. Tag a release, e.g. `git tag v0.1.0 && git push --tags`.
+4. The catalog service polls GitHub daily. There are no dependencies to vendor.
+
+## Operational notes
+
+- **Memory:** roughly a few MB per 100k entries, plus the response body during
+  parsing (bounded by `maxListBytes`). The 47k-entry Threat.Live list is small
+  in practice.
+- **Startup:** the first load is synchronous. With an unreachable provider,
+  Traefik can be delayed by up to `requestTimeout` per plugin instance; lower it
+  if you need faster starts.
+- **False positives:** use `allowList` for your own egress, health checkers and
+  known shared infrastructure. Consider logging blocked requests temporarily
+  while tuning.
+- **Provider etiquette:** respect each list's terms of service and rate limits.
+  The default 15 minute interval is intentionally conservative; many lists only
+  change hourly. Use per-provider intervals and conditional requests where
+  supported.
+- **Not a WAF:** this only checks source addresses against public lists. It does
+  not inspect payloads, and it cannot stop a compromised host on a clean address.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

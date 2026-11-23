@@ -1,0 +1,15 @@
+displayName: Threat DB
+type: middleware
+import: github.com/kallisti5/threatdb
+
+summary: Block clients whose IP addresses appear on one or more remote threat lists.
+
+testData:
+  refreshInterval: 1h
+  requestTimeout: 10s
+  statusPath: /_threatdb/status
+  providers:
+    threatlive:
+      name: Threat.Live
+      url: https://raw.githubusercontent.com/kallisti5/threatdb/main/testdata/sample-list.txt
+      minEntries: 1
