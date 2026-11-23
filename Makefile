@@ -20,8 +20,11 @@ bench:
 	$(GO) test -run '^$$' -bench . -benchmem ./...
 
 # Run the unit tests through Yaegi, the Go interpreter used by Traefik.
+# Pin the interpreter version so CI and local runs agree.
+YAEGI_VERSION ?= v0.16.3
+
 yaegi-test:
-	$(GO) run github.com/traefik/yaegi/cmd/yaegi@latest test -v .
+	$(GO) run github.com/traefik/yaegi/cmd/yaegi@$(YAEGI_VERSION) test -v .
 
 clean:
 	$(GO) clean

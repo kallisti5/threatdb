@@ -29,4 +29,4 @@ jobs:
         with:
           go-version: "1.23.x"
       - name: Test under Yaegi
-        run: go run github.com/traefik/yaegi/cmd/yaegi@latest test .
+        run: go run github.com/traefik/yaegi/cmd/yaegi@v0.16.3 test .

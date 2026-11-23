@@ -81,6 +81,7 @@ func (p *providerCache) loop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			logf(p.logPrefix, "provider %q: refresh loop stopped (context canceled)", p.name)
 			return
 		case <-timer.C:
 		}
@@ -281,7 +282,7 @@ func (p *providerCache) status(now time.Time, maxStale time.Duration) providerSt
 	status := providerStatus{
 		Key:       p.key,
 		Name:      p.name,
-		URL:       p.url,
+		URL:       redactedURL(p.url),
 		Entries:   p.entries,
 		Loaded:    p.set != nil,
 		Fetching:  p.fetching,

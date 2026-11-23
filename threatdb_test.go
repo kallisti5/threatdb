@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -657,4 +658,97 @@ func TestConcurrentRequestsAndRefresh(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestRefreshLoopsCoverAllProviders is a regression test for a Yaegi-specific
+// bug: starting goroutines with `go provider.loop(ctx)` inside a range loop
+// makes every goroutine use the last provider. Under Yaegi only the final
+// provider would ever refresh, so running the suite with `yaegi test` catches
+// a regression even though compiled Go handles the original code correctly.
+func TestRefreshLoopsCoverAllProviders(t *testing.T) {
+	first := &listHandler{body: "203.0.113.5\n"}
+	second := &listHandler{body: "198.51.100.7\n"}
+	firstServer := newListServer(t, first)
+	secondServer := newListServer(t, second)
+
+	config := CreateConfig()
+	config.Providers["a"] = Provider{URL: firstServer.URL, Name: "First"}
+	config.Providers["z"] = Provider{URL: secondServer.URL, Name: "Second"}
+	config.RefreshInterval = "25ms"
+	middleware := newTestMiddleware(t, config, nil)
+
+	if len(middleware.providers) != 2 {
+		t.Fatalf("providers = %d, want 2", len(middleware.providers))
+	}
+
+	first.setBody("203.0.113.6\n")
+	second.setBody("198.51.100.8\n")
+
+	waitFor(t, 3*time.Second, func() bool {
+		one, _ := middleware.providers[0].snapshot()
+		two, _ := middleware.providers[1].snapshot()
+		return one != nil && one.contains(parseIP("203.0.113.6")) &&
+			two != nil && two.contains(parseIP("198.51.100.8"))
+	})
+}
+
+func TestProviderHeadersNotForwardedAcrossHostRedirect(t *testing.T) {
+	var received http.Header
+
+	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		received = req.Header.Clone()
+		_, _ = rw.Write([]byte("203.0.113.5\n"))
+	}))
+	t.Cleanup(target.Close)
+
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		// 127.0.0.1 -> localhost is a cross-host redirect for the client.
+		http.Redirect(rw, req, "http://localhost:"+targetURL.Port()+"/list.txt", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	config := testConfig(redirector.URL)
+	config.Providers["test"] = Provider{
+		URL:     redirector.URL,
+		Name:    "TestList",
+		Headers: map[string]string{"X-Api-Key": "topsecret"},
+	}
+	newTestMiddleware(t, config, nil)
+
+	if received == nil {
+		t.Fatal("redirect target was not called")
+	}
+	if got := received.Get("X-Api-Key"); got != "" {
+		t.Errorf("X-Api-Key leaked to redirect target: %q", got)
+	}
+}
+
+func TestStatusRedactsProviderCredentials(t *testing.T) {
+	list := &listHandler{body: "203.0.113.5\n"}
+	server := newListServer(t, list)
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := testConfig("http://alice:supersecret@" + parsed.Host + "/list.txt")
+	config.StatusPath = "/_threatdb/status"
+	middleware := newTestMiddleware(t, config, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/_threatdb/status", nil)
+	recorder := httptest.NewRecorder()
+	middleware.ServeHTTP(recorder, req)
+
+	if strings.Contains(recorder.Body.String(), "supersecret") {
+		t.Errorf("status endpoint leaked the provider password: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), parsed.Host) {
+		t.Errorf("status endpoint should still show the provider host: %s", recorder.Body.String())
+	}
 }

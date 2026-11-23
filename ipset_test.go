@@ -3,6 +3,7 @@ package threatdb
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"net"
 	"strings"
 	"testing"
@@ -140,6 +141,61 @@ func TestIPSetNilAndInvalid(t *testing.T) {
 	}
 	if set.contains(net.IP{1, 2, 3}) {
 		t.Error("invalid IP should not match")
+	}
+}
+
+// TestIPSetMatchesIPNet cross-checks the prefix bucketing against the standard
+// library's net.IPNet.Contains for randomly generated networks and addresses.
+func TestIPSetMatchesIPNet(t *testing.T) {
+	random := rand.New(rand.NewSource(42))
+
+	randomIP := func(v6 bool) net.IP {
+		if v6 {
+			ip := make(net.IP, net.IPv6len)
+			_, _ = random.Read(ip)
+			return ip
+		}
+		return net.IPv4(byte(random.Intn(256)), byte(random.Intn(256)), byte(random.Intn(256)), byte(random.Intn(256)))
+	}
+
+	set := newIPSet()
+	var networks []*net.IPNet
+
+	for i := 0; i < 200; i++ {
+		ip := randomIP(i%2 == 1)
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		ones := random.Intn(bits + 1)
+
+		_, network, err := net.ParseCIDR(fmt.Sprintf("%s/%d", ip, ones))
+		if err != nil {
+			t.Fatalf("could not build random network: %v", err)
+		}
+		set.addCIDR(network)
+		networks = append(networks, network)
+
+		// Also add an exact address from time to time.
+		if i%5 == 0 {
+			set.addIP(ip)
+		}
+	}
+
+	for i := 0; i < 5000; i++ {
+		ip := randomIP(i%3 == 0)
+
+		want := false
+		for _, network := range networks {
+			if network.Contains(ip) {
+				want = true
+				break
+			}
+		}
+
+		if got := set.contains(ip); got != want {
+			t.Fatalf("contains(%s) = %v, want %v", ip, got, want)
+		}
 	}
 }
 

@@ -53,7 +53,7 @@ experimental:
   plugins:
     threatdb:
       moduleName: github.com/kallisti5/threatdb
-      version: v0.1.0
+      version: v0.1.1
 ```
 
 Then use it from the dynamic configuration:
@@ -147,7 +147,7 @@ entries are processed in sorted key order, which keeps messages deterministic.
 | `url` | string | *(required)* | Absolute `http` or `https` URL of the list. |
 | `name` | string | provider key | Display name used in messages and `X-Threat-List`. |
 | `refreshInterval` | duration | global value | Per-provider override. `0` fetches once at startup and never refreshes. |
-| `headers` | map | `{}` | Extra request headers, e.g. an API token. |
+| `headers` | map | `{}` | Extra request headers, e.g. an API token. Headers are dropped if the provider redirects to a different scheme, host or port. |
 | `minEntries` | int | `0` | Reject a download with fewer parsed entries, protecting against truncation or error pages. |
 | `maxListBytes` | int | global value | Per-provider size limit. |
 
@@ -337,17 +337,53 @@ refreshes.
    repository lives elsewhere, update `module` in `go.mod`, `import` in
    [`.traefik.yml`](.traefik.yml), and the paths in this README.
 2. Add the `traefik-plugin` topic to the GitHub repository.
-3. Tag a release, e.g. `git tag v0.1.0 && git push --tags`.
-4. The catalog service polls GitHub daily. There are no dependencies to vendor.
+3. Tag a release, e.g. `git tag v0.1.1 && git push origin main v0.1.1`.
+4. The catalog service polls GitHub **once a day**, so a new plugin or version
+   can take up to 24 hours to become downloadable. There are no dependencies to
+   vendor.
+
+Until the catalog has indexed the version, Traefik returns:
+
+```text
+unable to download plugin github.com/kallisti5/threatdb:
+error: 404: {"error":"Unknown plugin: github.com/kallisti5/threatdb@v0.1.1"}
+```
+
+Check whether a version is available yet (HTTP 200 means yes, 404 means the
+catalog has not indexed it):
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  https://plugins.traefik.io/public/download/github.com/kallisti5/threatdb/v0.1.1
+```
+
+Use [local plugin mode](#local-plugin-mode) to run the plugin without waiting
+for the catalog. If the catalog rejects a plugin during validation it opens an
+issue in the repository; check the Issues tab if the version is still unknown
+after a couple of days.
 
 ## Operational notes
 
-- **Memory:** roughly a few MB per 100k entries, plus the response body during
-  parsing (bounded by `maxListBytes`). The 47k-entry Threat.Live list is small
-  in practice.
+- **One instance per router:** Traefik constructs a middleware instance for
+  every router that references it. Each instance holds its own parsed copy of
+  every list and runs its own refresh goroutines, so ten routers means ten
+  copies and ten downloads per interval. With the sample 47k-entry list the
+  parsed copy is about 1 MiB, so this is usually only a bandwidth and start-up
+  cost, but keep the number of routers referencing the middleware in mind.
+- **Memory:** about 1 MiB per 47k addresses (roughly 2 MB per 100k entries),
+  plus the response body during parsing (bounded by `maxListBytes`).
+- **Use HTTPS for providers:** `http://` URLs are accepted for local or
+  private lists, but a cleartext response can be modified in transit and
+  inject or remove addresses.
+- **Status endpoint is unauthenticated:** anyone who can reach the router can
+  read provider names, URLs and entry counts. Restrict it at the router level
+  or leave `statusPath` empty.
+- **Fail-open by default:** if a list has never loaded, requests are allowed
+  unless `failClosed` is set. Watch the status endpoint or the plugin's error
+  logs if an outage must not silently disable filtering.
 - **Startup:** the first load is synchronous. With an unreachable provider,
-  Traefik can be delayed by up to `requestTimeout` per plugin instance; lower it
-  if you need faster starts.
+  Traefik can be delayed by up to `requestTimeout` per plugin instance; lower
+  it if you need faster starts.
 - **False positives:** use `allowList` for your own egress, health checkers and
   known shared infrastructure. Consider logging blocked requests temporarily
   while tuning.

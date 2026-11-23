@@ -23,7 +23,7 @@ import (
 )
 
 // Version is the plugin version, also reported by the optional status endpoint.
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 const (
 	defaultRefreshInterval    = 15 * time.Minute
@@ -240,7 +240,13 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		if p.interval <= 0 {
 			continue
 		}
-		go p.loop(ctx)
+		// Pass the provider as an argument instead of writing
+		// `go p.loop(ctx)`: Yaegi evaluates a method receiver on a range
+		// variable lazily, which would start every goroutine with the last
+		// provider in the slice and leave the other lists unrefreshed.
+		go func(provider *providerCache) {
+			provider.loop(ctx)
+		}(p)
 	}
 
 	return m, nil
@@ -462,11 +468,58 @@ func buildProviders(config *Config, opts *options, prefix string) ([]*providerCa
 			maxListBytes: maxListBytes,
 			userAgent:    opts.userAgent,
 			logPrefix:    prefix,
-			client:       &http.Client{},
+			client:       newHTTPClient(),
 		})
 	}
 
 	return providers, nil
+}
+
+// newHTTPClient returns the client used to download lists.
+//
+// Go strips Authorization and Cookie headers when a redirect switches
+// domains, but it keeps arbitrary custom headers (for example X-Api-Key).
+// Provider headers may contain credentials, so strip everything except a
+// couple of harmless headers whenever a redirect leaves the original
+// scheme+host (including port changes).
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after 5 redirects")
+			}
+			if len(via) > 0 && !sameOrigin(req.URL, via[0].URL) {
+				// Rebuild the header set from scratch: only keep the headers
+				// that are both harmless and useful for the redirected fetch.
+				safe := make(http.Header)
+				for _, key := range []string{"User-Agent", "Accept"} {
+					if value := req.Header.Get(key); value != "" {
+						safe.Set(key, value)
+					}
+				}
+				req.Header = safe
+			}
+			return nil
+		},
+	}
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+// redactedURL removes credentials from a provider URL before it is exposed
+// by the status endpoint.
+func redactedURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	parsed.User = nil
+	return parsed.String()
 }
 
 func copyHeaders(headers map[string]string) map[string]string {

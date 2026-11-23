@@ -96,6 +96,22 @@ func TestClientIPForwardedHeader(t *testing.T) {
 			remote: "10.0.0.9:5000",
 			want:   "203.0.113.5",
 		},
+		{
+			name:   "empty entries are ignored",
+			header: "X-Forwarded-For",
+			value:  "198.51.100.1, , 203.0.113.5",
+			depth:  2,
+			remote: "10.0.0.9:5000",
+			want:   "198.51.100.1",
+		},
+		{
+			name:   "trailing comma is ignored",
+			header: "X-Forwarded-For",
+			value:  "203.0.113.5, ",
+			depth:  1,
+			remote: "10.0.0.9:5000",
+			want:   "203.0.113.5",
+		},
 	}
 
 	for _, test := range tests {
@@ -126,6 +142,36 @@ func TestClientIPIgnoresHeaderWhenUntrusted(t *testing.T) {
 	ip := clientIP(req, "X-Forwarded-For", 0)
 	if ip == nil || ip.String() != "192.0.2.10" {
 		t.Fatalf("clientIP = %v, want 192.0.2.10", ip)
+	}
+}
+
+func TestClientIPIPv6Zone(t *testing.T) {
+	tests := []struct {
+		remote string
+		want   string
+	}{
+		{"[fe80::1%eth0]:443", "fe80::1"},
+		{"fe80::1%eth0", "fe80::1"},
+		{"[2001:db8::1%25eth0]:443", "2001:db8::1"},
+	}
+
+	for _, test := range tests {
+		ip := parseIP(test.remote)
+		if ip == nil {
+			t.Errorf("parseIP(%q) = nil", test.remote)
+			continue
+		}
+		if got := ip.String(); got != test.want {
+			t.Errorf("parseIP(%q) = %q, want %q", test.remote, got, test.want)
+		}
+	}
+
+	set, _, _, err := parseList([]byte("fe80::1%eth0\n"))
+	if err != nil {
+		t.Fatalf("addList returned error: %v", err)
+	}
+	if !set.contains(parseIP("fe80::1")) {
+		t.Error("zoned list entry should match an unzoned lookup")
 	}
 }
 
