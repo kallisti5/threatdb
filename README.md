@@ -13,6 +13,7 @@ Blocked clients get a friendly explanation instead of a bare 403.
 - Zero third-party dependencies, so it runs cleanly under Yaegi.
 - Parses each list once and shares it across middleware instances with the same
   provider settings.
+- Optional Tor exit-node allow list, refreshed automatically.
 - Optional status endpoint with JSON details and Prometheus metrics.
 
 > The lists are third-party data. Shared addresses (CGNAT, VPNs, cloud egress,
@@ -123,6 +124,7 @@ See [`dev/`](dev/) for a ready-to-run Docker Compose setup.
 | `unavailableMessage` | string | see below | Body used when `failClosed` is on and a list has not loaded. |
 | `contentType` | string | `text/plain; charset=utf-8` | `Content-Type` of block responses. |
 | `allowList` | list | `[]` | IPs or CIDRs that are never blocked (e.g. `203.0.113.4`, `2001:db8::/32`). |
+| `allowTor` | bool | `false` | Allow published Tor exit-node addresses, refreshed every 60 minutes. See [Tor exit nodes](#tor-exit-nodes). |
 | `excludePrivateIPs` | bool | `false` | Let loopback, private, link-local, multicast and CGNAT addresses bypass the lists. |
 | `trustedProxyDepth` | int | `0` | Trust the last N hops of the forwarded header. `0` uses the TCP peer address. |
 | `forwardedForHeader` | string | `X-Forwarded-For` | Header used when `trustedProxyDepth > 0`. |
@@ -196,6 +198,36 @@ Any text response containing addresses is accepted:
 
 An empty result, an HTML error page, an oversized body, or a list smaller than
 `minEntries` is rejected and the previous copy is kept.
+
+## Tor exit nodes
+
+Set `allowTor: true` to permit clients whose addresses are published as Tor exit
+nodes. The plugin downloads
+[`https://check.torproject.org/exit-addresses`](https://check.torproject.org/exit-addresses)
+at startup and every 30 minutes, parses the `ExitAddress` lines, and checks
+that set before the blocking lists. A Tor exit node is allowed even if the same
+address appears on a configured threat list.
+
+```yaml
+http:
+  middlewares:
+    threatdb:
+      plugin:
+        threatdb:
+          allowTor: true
+          providers:
+            threatlive:
+              name: Threat.Live
+              url: https://list.threat.live
+```
+
+If the Tor list cannot be downloaded, the plugin keeps the last good copy and
+continues normal blocking. Tor list availability does not affect `failClosed`:
+only the configured threat lists participate in that decision. Tor clients are
+checked before the blocking lists, so `failClosed` does not reject an identified
+Tor exit node. The status endpoint
+reports the Tor list in a `tor` object, and Prometheus metrics include
+`threatdb_tor_*` and `threatdb_allowed_tor_total`.
 
 ## Client IP handling
 
@@ -277,6 +309,7 @@ a JSON snapshot by default:
   "stats": {
     "requests": 184233,
     "allowed": 184220,
+    "allowedTor": 842,
     "rejectedMatches": 13,
     "rejectedUnavailable": 0,
     "noClientIP": 0
@@ -349,6 +382,7 @@ Exported metrics:
 | --- | --- | --- |
 | `threatdb_requests_total` | counter | Requests evaluated by the middleware. |
 | `threatdb_allowed_total` | counter | Requests forwarded to the next handler. |
+| `threatdb_allowed_tor_total` | counter | Requests allowed because the client is a Tor exit node. |
 | `threatdb_rejected_total{reason}` | counter | Rejected requests, `reason="match"` or `"unavailable"`. |
 | `threatdb_no_client_ip_total` | counter | Requests forwarded because no client IP could be determined. |
 | `threatdb_info{middleware,version}` | gauge | Always `1`; identifies the middleware instance. |
@@ -361,7 +395,13 @@ Exported metrics:
 | `threatdb_provider_last_success_timestamp_seconds{provider}` | gauge | Unix time of the last successful refresh. |
 | `threatdb_provider_last_attempt_timestamp_seconds{provider}` | gauge | Unix time of the last refresh attempt. |
 | `threatdb_provider_last_refresh_duration_seconds{provider}` | gauge | Duration of the most recent refresh attempt. |
+| `threatdb_tor_loaded` | gauge | `1` when the Tor exit-node list is loaded. Only exported when `allowTor` is enabled. |
+| `threatdb_tor_stale` | gauge | `1` when the Tor list is older than `maxStale`. |
+| `threatdb_tor_entries` | gauge | Tor exit addresses currently loaded. |
+| `threatdb_tor_last_success_timestamp_seconds` | gauge | Unix time of the last successful Tor list refresh. |
+| `threatdb_tor_refresh_total{result}` | counter | Tor list refresh attempts, `result="success"` or `"failure"`. |
 
+`threatdb_tor_*` metrics are only exported when `allowTor` is enabled. The
 `provider` labels are the configuration keys, not display names, so dashboards
 keep working if you rename a list. Timestamps are `0` until the first attempt or
 success. Useful alerts are `threatdb_provider_loaded == 0` (with
@@ -407,8 +447,8 @@ make bench         # set lookup benchmark
 
 The test suite covers list parsing, IPv4/IPv6/CIDR matching, client IP
 extraction, scheduling and refresh, conditional requests, stale-data retention,
-configuration validation, shared provider caches, the status endpoint, and
-concurrent traffic during refreshes.
+configuration validation, shared provider caches, Tor exit parsing, the status
+endpoint, and concurrent traffic during refreshes.
 
 ## Publishing to the Traefik plugin catalog
 

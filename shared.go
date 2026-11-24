@@ -21,6 +21,7 @@ const providerShareGrace = 5 * time.Second
 // parsed copy; display names and middleware prefixes do not affect the list and
 // are therefore not part of the identity.
 type providerShareSettings struct {
+	kind         string
 	url          string
 	headers      map[string]string
 	interval     time.Duration
@@ -44,6 +45,7 @@ type providerPlan struct {
 func (s providerShareSettings) key() string {
 	var b strings.Builder
 
+	writeShareField(&b, s.kind)
 	writeShareField(&b, s.url)
 	writeShareField(&b, s.interval.String())
 	writeShareField(&b, s.timeout.String())
@@ -131,5 +133,8 @@ func (m *Middleware) releaseSharedProviders(ctx context.Context) {
 
 	for _, provider := range m.providers {
 		releaseSharedProvider(provider.cache)
+	}
+	if m.tor != nil {
+		releaseSharedProvider(m.tor)
 	}
 }

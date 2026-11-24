@@ -87,6 +87,11 @@ type Config struct {
 	// AllowList contains IP addresses or CIDR ranges that are never blocked.
 	AllowList []string `json:"allowList,omitempty"`
 
+	// AllowTor permits clients whose addresses appear in the Tor Project's
+	// published exit-node list. The list is downloaded at startup and
+	// refreshed every 60 minutes. Defaults to false.
+	AllowTor bool `json:"allowTor,omitempty"`
+
 	// ExcludePrivateIPs lets loopback, private, link-local, multicast and
 	// CGNAT addresses bypass the lists. Useful when Traefik sits behind a
 	// load balancer on a private network. Defaults to false.
@@ -181,6 +186,7 @@ type options struct {
 	message            string
 	unavailableMessage string
 	contentType        string
+	allowTor           bool
 	excludePrivate     bool
 	proxyDepth         int
 	forwardedHeader    string
@@ -195,6 +201,7 @@ type options struct {
 type stats struct {
 	requests            int64
 	allowed             int64
+	allowedTor          int64
 	rejectedMatches     int64
 	rejectedUnavailable int64
 	noClientIP          int64
@@ -204,6 +211,7 @@ type stats struct {
 type statsSnapshot struct {
 	Requests            int64 `json:"requests"`
 	Allowed             int64 `json:"allowed"`
+	AllowedTor          int64 `json:"allowedTor"`
 	RejectedMatches     int64 `json:"rejectedMatches"`
 	RejectedUnavailable int64 `json:"rejectedUnavailable"`
 	NoClientIP          int64 `json:"noClientIP"`
@@ -213,6 +221,7 @@ func (s *stats) snapshot() statsSnapshot {
 	return statsSnapshot{
 		Requests:            atomic.LoadInt64(&s.requests),
 		Allowed:             atomic.LoadInt64(&s.allowed),
+		AllowedTor:          atomic.LoadInt64(&s.allowedTor),
 		RejectedMatches:     atomic.LoadInt64(&s.rejectedMatches),
 		RejectedUnavailable: atomic.LoadInt64(&s.rejectedUnavailable),
 		NoClientIP:          atomic.LoadInt64(&s.noClientIP),
@@ -226,6 +235,7 @@ type Middleware struct {
 	opts      options
 	allow     *ipSet
 	providers []*providerView
+	tor       *providerCache
 	prefix    string
 	// stats is a pointer so its first 64-bit counter stays aligned for
 	// sync/atomic on 32-bit platforms.
@@ -259,12 +269,18 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		return nil, err
 	}
 
+	var tor *providerCache
+	if opts.allowTor {
+		tor = buildTorProvider(opts, prefix)
+	}
+
 	m := &Middleware{
 		next:      next,
 		name:      name,
 		opts:      *opts,
 		allow:     allow,
 		providers: providers,
+		tor:       tor,
 		prefix:    prefix,
 		stats:     &stats{},
 	}
@@ -281,6 +297,12 @@ waitLoop:
 		case <-p.cache.ready:
 		case <-ctx.Done():
 			break waitLoop
+		}
+	}
+	if tor != nil {
+		select {
+		case <-tor.ready:
+		case <-ctx.Done():
 		}
 	}
 
@@ -314,6 +336,15 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		atomic.AddInt64(&m.stats.allowed, 1)
 		m.next.ServeHTTP(rw, req)
 		return
+	}
+
+	if m.tor != nil {
+		if set, loaded := m.tor.snapshot(); loaded && set.contains(ip) {
+			atomic.AddInt64(&m.stats.allowed, 1)
+			atomic.AddInt64(&m.stats.allowedTor, 1)
+			m.next.ServeHTTP(rw, req)
+			return
+		}
 	}
 
 	var matches []string
@@ -435,6 +466,7 @@ func parseOptions(config *Config) (*options, *ipSet, error) {
 		message:            stringOrDefault(config.Message, defaultMessage),
 		unavailableMessage: stringOrDefault(config.UnavailableMessage, defaultUnavailableMessage),
 		contentType:        stringOrDefault(config.ContentType, defaultContentType),
+		allowTor:           config.AllowTor,
 		excludePrivate:     config.ExcludePrivateIPs,
 		proxyDepth:         config.TrustedProxyDepth,
 		forwardedHeader:    stringOrDefault(config.ForwardedForHeader, defaultForwardedHeader),
@@ -512,6 +544,7 @@ func buildProviders(config *Config, opts *options, prefix string) ([]*providerVi
 			key:  key,
 			name: name,
 			settings: providerShareSettings{
+				kind:         "list",
 				url:          rawURL,
 				headers:      copyHeaders(provider.Headers),
 				interval:     interval,

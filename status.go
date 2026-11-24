@@ -17,6 +17,7 @@ type statusResponse struct {
 	BlockStatusCode int              `json:"blockStatusCode"`
 	MaxStaleSeconds int64            `json:"maxStaleSeconds"`
 	Stats           statsSnapshot    `json:"stats"`
+	Tor             *providerStatus  `json:"tor,omitempty"`
 	Providers       []providerStatus `json:"providers"`
 }
 
@@ -51,6 +52,10 @@ func (m *Middleware) serveStatus(rw http.ResponseWriter, req *http.Request) {
 
 	for _, provider := range m.providers {
 		status.Providers = append(status.Providers, provider.status(now, m.opts.maxStale))
+	}
+	if m.tor != nil {
+		torStatus := m.tor.status(now, m.opts.maxStale)
+		status.Tor = &torStatus
 	}
 
 	body, err := json.MarshalIndent(status, "", "  ")
@@ -100,6 +105,10 @@ func (m *Middleware) serveMetrics(rw http.ResponseWriter, now time.Time) {
 	writeMetricHeader(&b, "threatdb_allowed_total", "counter",
 		"Total number of requests allowed through to the next handler.")
 	fmt.Fprintf(&b, "threatdb_allowed_total %d\n\n", s.Allowed)
+
+	writeMetricHeader(&b, "threatdb_allowed_tor_total", "counter",
+		"Total number of requests allowed because the client is a Tor exit node.")
+	fmt.Fprintf(&b, "threatdb_allowed_tor_total %d\n\n", s.AllowedTor)
 
 	writeMetricHeader(&b, "threatdb_rejected_total", "counter",
 		"Total number of requests rejected by the middleware, by reason.")
@@ -163,6 +172,31 @@ func (m *Middleware) serveMetrics(rw http.ResponseWriter, now time.Time) {
 			escapeLabel(status.Key), status.RefreshFailures)
 	}
 	b.WriteString("\n")
+
+	if m.tor != nil {
+		tor := m.tor.status(now, m.opts.maxStale)
+
+		writeMetricHeader(&b, "threatdb_tor_loaded", "gauge",
+			"Whether the Tor exit-node list has been loaded (1) or not (0).")
+		fmt.Fprintf(&b, "threatdb_tor_loaded %g\n\n", boolValue(tor.Loaded))
+
+		writeMetricHeader(&b, "threatdb_tor_stale", "gauge",
+			"Whether the Tor exit-node list is stale (1) or not (0).")
+		fmt.Fprintf(&b, "threatdb_tor_stale %g\n\n", boolValue(tor.Stale))
+
+		writeMetricHeader(&b, "threatdb_tor_entries", "gauge",
+			"Number of Tor exit addresses currently loaded.")
+		fmt.Fprintf(&b, "threatdb_tor_entries %d\n\n", tor.Entries)
+
+		writeMetricHeader(&b, "threatdb_tor_last_success_timestamp_seconds", "gauge",
+			"Unix timestamp of the last successful Tor list refresh, or 0 if never loaded.")
+		fmt.Fprintf(&b, "threatdb_tor_last_success_timestamp_seconds %d\n\n", tor.lastSuccessUnix)
+
+		writeMetricHeader(&b, "threatdb_tor_refresh_total", "counter",
+			"Total number of Tor exit-node list refresh attempts, by result.")
+		fmt.Fprintf(&b, "threatdb_tor_refresh_total{result=\"success\"} %d\n", tor.RefreshSuccesses)
+		fmt.Fprintf(&b, "threatdb_tor_refresh_total{result=\"failure\"} %d\n\n", tor.RefreshFailures)
+	}
 
 	rw.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	rw.Header().Set("Cache-Control", "no-store")

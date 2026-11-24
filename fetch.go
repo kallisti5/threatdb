@@ -18,6 +18,10 @@ const (
 	retryMaxDelay = 5 * time.Minute
 )
 
+// listParser parses a downloaded list into a set. valid and invalid count the
+// lines that did and did not produce entries.
+type listParser func([]byte) (*ipSet, int, int, error)
+
 // providerCache owns the downloaded copy of a single threat list and keeps it
 // up to date in the background.
 //
@@ -44,6 +48,7 @@ type providerCache struct {
 	userAgent    string
 	logPrefix    string
 	client       *http.Client
+	parse        listParser
 
 	mu           sync.RWMutex
 	set          *ipSet
@@ -318,7 +323,11 @@ func (p *providerCache) fetch(ctx context.Context, etag, lastModified string) (i
 		return entries, true, nil
 	}
 
-	set, valid, invalid, err := parseList(body)
+	parse := p.parse
+	if parse == nil {
+		parse = parseList
+	}
+	set, valid, invalid, err := parse(body)
 	if err != nil {
 		return 0, false, fmt.Errorf("parse response: %w", err)
 	}
@@ -415,6 +424,7 @@ func newProviderCache(key, name string, settings providerShareSettings, logPrefi
 		userAgent:    settings.userAgent,
 		logPrefix:    logPrefix,
 		client:       newHTTPClient(),
+		parse:        parseList,
 	}
 }
 
