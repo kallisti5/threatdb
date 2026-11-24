@@ -53,7 +53,7 @@ experimental:
   plugins:
     threatdb:
       moduleName: github.com/kallisti5/threatdb
-      version: v0.1.1
+      version: v0.1.2
 ```
 
 Then use it from the dynamic configuration:
@@ -337,7 +337,7 @@ refreshes.
    repository lives elsewhere, update `module` in `go.mod`, `import` in
    [`.traefik.yml`](.traefik.yml), and the paths in this README.
 2. Add the `traefik-plugin` topic to the GitHub repository.
-3. Tag a release, e.g. `git tag v0.1.1 && git push origin main v0.1.1`.
+3. Tag a release, e.g. `git tag v0.1.2 && git push origin main v0.1.2`.
 4. The catalog service polls GitHub **once a day**, so a new plugin or version
    can take up to 24 hours to become downloadable. There are no dependencies to
    vendor.
@@ -346,7 +346,7 @@ Until the catalog has indexed the version, Traefik returns:
 
 ```text
 unable to download plugin github.com/kallisti5/threatdb:
-error: 404: {"error":"Unknown plugin: github.com/kallisti5/threatdb@v0.1.1"}
+error: 404: {"error":"Unknown plugin: github.com/kallisti5/threatdb@v0.1.2"}
 ```
 
 Check whether a version is available yet (HTTP 200 means yes, 404 means the
@@ -354,7 +354,7 @@ catalog has not indexed it):
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' \
-  https://plugins.traefik.io/public/download/github.com/kallisti5/threatdb/v0.1.1
+  https://plugins.traefik.io/public/download/github.com/kallisti5/threatdb/v0.1.2
 ```
 
 Use [local plugin mode](#local-plugin-mode) to run the plugin without waiting
