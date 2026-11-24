@@ -204,7 +204,7 @@ An empty result, an HTML error page, an oversized body, or a list smaller than
 Set `allowTor: true` to permit clients whose addresses are published as Tor exit
 nodes. The plugin downloads
 [`https://check.torproject.org/exit-addresses`](https://check.torproject.org/exit-addresses)
-at startup and every 30 minutes, parses the `ExitAddress` lines, and checks
+at startup and every 60 minutes, parses the `ExitAddress` lines, and checks
 that set before the blocking lists. A Tor exit node is allowed even if the same
 address appears on a configured threat list.
 
