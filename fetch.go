@@ -2,8 +2,10 @@ package threatdb
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"sync"
@@ -51,6 +53,7 @@ type providerCache struct {
 	lastErr      string
 	etag         string
 	lastModified string
+	digest       [sha256.Size]byte
 	fetching     bool
 	lastDuration time.Duration
 }
@@ -68,6 +71,12 @@ func (p *providerCache) snapshot() (*ipSet, bool) {
 func (p *providerCache) run() {
 	p.refresh(p.ctx)
 	close(p.ready)
+
+	// An interval of zero means "fetch once at startup and never refresh".
+	// Calling loop here would schedule zero-delay timers forever.
+	if p.interval <= 0 {
+		return
+	}
 	p.loop(p.ctx)
 }
 
@@ -102,7 +111,7 @@ func (v *providerView) status(now time.Time, maxStale time.Duration) providerSta
 // provider is unavailable.
 func (p *providerCache) loop(ctx context.Context) {
 	failures := 0
-	wait := p.interval
+	wait := p.refreshDelay()
 
 	if _, loaded := p.snapshot(); !loaded {
 		failures = 1
@@ -121,7 +130,7 @@ func (p *providerCache) loop(ctx context.Context) {
 
 		if p.refresh(ctx) {
 			failures = 0
-			wait = p.interval
+			wait = p.refreshDelay()
 			continue
 		}
 
@@ -132,6 +141,25 @@ func (p *providerCache) loop(ctx context.Context) {
 		failures++
 		wait = p.retryDelay(failures)
 	}
+}
+
+// refreshDelay returns the configured interval with a small positive spread.
+// Staggering refreshes keeps providers that share an interval from rebuilding
+// their lists in the same CPU burst.
+func (p *providerCache) refreshDelay() time.Duration {
+	if p.interval <= 0 {
+		return p.interval
+	}
+
+	spread := p.interval / 10
+	if spread > time.Minute {
+		spread = time.Minute
+	}
+	if spread <= 0 {
+		return p.interval
+	}
+
+	return p.interval + time.Duration(rand.Int63n(int64(spread)))
 }
 
 // retryDelay returns the delay before the next attempt after n consecutive
@@ -179,7 +207,7 @@ func (p *providerCache) refresh(ctx context.Context) bool {
 	p.mu.Unlock()
 
 	started := time.Now()
-	entries, notModified, err := p.fetch(ctx, etag, lastModified)
+	entries, unchanged, err := p.fetch(ctx, etag, lastModified)
 	elapsed := time.Since(started).Round(time.Millisecond)
 
 	p.mu.Lock()
@@ -202,8 +230,8 @@ func (p *providerCache) refresh(ctx context.Context) bool {
 
 	atomic.AddInt64(&p.refreshSuccesses, 1)
 
-	if notModified {
-		logf(p.logPrefix, "provider %q: list unchanged (HTTP 304, %s)", p.name, elapsed)
+	if unchanged {
+		logf(p.logPrefix, "provider %q: list unchanged (%s)", p.name, elapsed)
 	} else {
 		logf(p.logPrefix, "provider %q: loaded %d entries in %s", p.name, entries, elapsed)
 	}
@@ -212,7 +240,8 @@ func (p *providerCache) refresh(ctx context.Context) bool {
 }
 
 // fetch downloads and parses the list. On success it replaces the cached copy
-// atomically under the lock.
+// atomically under the lock. The boolean reports that the downloaded list was
+// unchanged, either through HTTP validators or an identical body digest.
 func (p *providerCache) fetch(ctx context.Context, etag, lastModified string) (int, bool, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
@@ -270,6 +299,25 @@ func (p *providerCache) fetch(ctx context.Context, etag, lastModified string) (i
 		return 0, false, fmt.Errorf("response is larger than maxListBytes (%d)", p.maxListBytes)
 	}
 
+	// Providers that do not support conditional requests still often return
+	// byte-for-byte identical lists. Hashing costs a fraction of parsing and
+	// avoids rebuilding hundreds of thousands of map entries on every refresh.
+	digest := sha256.Sum256(body)
+	p.mu.RLock()
+	unchanged := p.set != nil && p.digest == digest
+	entries := p.entries
+	p.mu.RUnlock()
+
+	if unchanged {
+		p.mu.Lock()
+		p.lastSuccess = time.Now()
+		p.etag = response.Header.Get("ETag")
+		p.lastModified = response.Header.Get("Last-Modified")
+		p.lastErr = ""
+		p.mu.Unlock()
+		return entries, true, nil
+	}
+
 	set, valid, invalid, err := parseList(body)
 	if err != nil {
 		return 0, false, fmt.Errorf("parse response: %w", err)
@@ -287,6 +335,7 @@ func (p *providerCache) fetch(ctx context.Context, etag, lastModified string) (i
 	p.lastSuccess = time.Now()
 	p.etag = response.Header.Get("ETag")
 	p.lastModified = response.Header.Get("Last-Modified")
+	p.digest = digest
 	p.lastErr = ""
 	p.mu.Unlock()
 

@@ -8,7 +8,8 @@ Blocked clients get a friendly explanation instead of a bare 403.
 - Matches IPv4 and IPv6 addresses, single IPs and CIDR ranges.
 - Keeps the last good copy when a provider is down, with retry/backoff.
 - Sends conditional requests (`If-None-Match` / `If-Modified-Since`) when the
-  provider supports them.
+  provider supports them, and skips re-parsing when a 200 response has the same
+  body digest.
 - Zero third-party dependencies, so it runs cleanly under Yaegi.
 - Parses each list once and shares it across middleware instances with the same
   provider settings.
@@ -25,7 +26,8 @@ Blocked clients get a friendly explanation instead of a bare 403.
    `requestTimeout`).
 2. Each list is kept in memory as a hash set of addresses plus CIDR networks
    bucketed by prefix length.
-3. A background goroutine refreshes each list on its own interval. Failed
+3. A background goroutine refreshes each list on its own interval, with a small
+   random spread so providers do not all rebuild their lists at once. Failed
    refreshes are retried with exponential backoff (10s up to 5m), while the last
    good copy keeps being used.
 4. On every request the client address is checked against the cached sets. Only
@@ -454,9 +456,8 @@ after a couple of days.
   `threatdb` plugin.
 - **Memory:** one parsed copy per distinct provider configuration, plus the
   response body during parsing (bounded by `maxListBytes`). Exact IPv4 entries
-  cost tens of bytes each after overhead; for example 800k exact addresses
-  retained roughly 45 MiB in testing. During a refresh the old and new copies
-  briefly coexist.
+  are stored in numeric maps; 800k exact addresses retained roughly 9 MiB in
+  testing. During a refresh the old and new copies briefly coexist.
 - **Use HTTPS for providers:** `http://` URLs are accepted for local or
   private lists, but a cleartext response can be modified in transit and
   inject or remove addresses.

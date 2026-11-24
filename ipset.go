@@ -3,6 +3,7 @@ package threatdb
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"net"
 	"strings"
 )
@@ -14,11 +15,11 @@ import (
 // hash probe per distinct prefix length (usually a handful) instead of a
 // linear scan over every network.
 type ipSet struct {
-	exact4 map[string]struct{}
-	exact6 map[string]struct{}
+	exact4 map[uint32]struct{}
+	exact6 map[[16]byte]struct{}
 
-	cidr4 map[int]map[string]struct{}
-	cidr6 map[int]map[string]struct{}
+	cidr4 map[int]map[uint32]struct{}
+	cidr6 map[int]map[[16]byte]struct{}
 
 	lengths4 []int
 	lengths6 []int
@@ -28,10 +29,10 @@ type ipSet struct {
 
 func newIPSet() *ipSet {
 	return &ipSet{
-		exact4: make(map[string]struct{}),
-		exact6: make(map[string]struct{}),
-		cidr4:  make(map[int]map[string]struct{}),
-		cidr6:  make(map[int]map[string]struct{}),
+		exact4: make(map[uint32]struct{}),
+		exact6: make(map[[16]byte]struct{}),
+		cidr4:  make(map[int]map[uint32]struct{}),
+		cidr6:  make(map[int]map[[16]byte]struct{}),
 	}
 }
 
@@ -64,7 +65,7 @@ func addEntry(set *ipSet, field string) bool {
 // IPv4 so that providers do not need to be consistent about representation.
 func (s *ipSet) addIP(ip net.IP) {
 	if v4 := ip.To4(); v4 != nil {
-		key := string(v4)
+		key := binary.BigEndian.Uint32(v4)
 		if _, exists := s.exact4[key]; !exists {
 			s.exact4[key] = struct{}{}
 			s.size++
@@ -76,7 +77,8 @@ func (s *ipSet) addIP(ip net.IP) {
 	if v6 == nil {
 		return
 	}
-	key := string(v6)
+	var key [16]byte
+	copy(key[:], v6)
 	if _, exists := s.exact6[key]; !exists {
 		s.exact6[key] = struct{}{}
 		s.size++
@@ -116,9 +118,11 @@ func (s *ipSet) addCIDR(network *net.IPNet) {
 		if ip6 == nil {
 			return
 		}
-		key := maskIP(ip6, ones)
+		var raw [16]byte
+		copy(raw[:], ip6)
+		key := mask6(raw, ones)
 		if s.cidr6[ones] == nil {
-			s.cidr6[ones] = make(map[string]struct{})
+			s.cidr6[ones] = make(map[[16]byte]struct{})
 			s.lengths6 = append(s.lengths6, ones)
 		}
 		if _, exists := s.cidr6[ones][key]; !exists {
@@ -132,9 +136,9 @@ func (s *ipSet) addCIDR4(ip4 net.IP, ones int) {
 	if ones < 0 || ones > 32 {
 		return
 	}
-	key := maskIP(ip4, ones)
+	key := mask4(binary.BigEndian.Uint32(ip4), ones)
 	if s.cidr4[ones] == nil {
-		s.cidr4[ones] = make(map[string]struct{})
+		s.cidr4[ones] = make(map[uint32]struct{})
 		s.lengths4 = append(s.lengths4, ones)
 	}
 	if _, exists := s.cidr4[ones][key]; !exists {
@@ -150,11 +154,12 @@ func (s *ipSet) contains(ip net.IP) bool {
 	}
 
 	if v4 := ip.To4(); v4 != nil {
-		if _, exists := s.exact4[string(v4)]; exists {
+		key := binary.BigEndian.Uint32(v4)
+		if _, exists := s.exact4[key]; exists {
 			return true
 		}
 		for _, ones := range s.lengths4 {
-			if _, exists := s.cidr4[ones][maskIP(v4, ones)]; exists {
+			if _, exists := s.cidr4[ones][mask4(key, ones)]; exists {
 				return true
 			}
 		}
@@ -165,36 +170,48 @@ func (s *ipSet) contains(ip net.IP) bool {
 	if v6 == nil {
 		return false
 	}
-	if _, exists := s.exact6[string(v6)]; exists {
+	var key [16]byte
+	copy(key[:], v6)
+	if _, exists := s.exact6[key]; exists {
 		return true
 	}
 	for _, ones := range s.lengths6 {
-		if _, exists := s.cidr6[ones][maskIP(v6, ones)]; exists {
+		if _, exists := s.cidr6[ones][mask6(key, ones)]; exists {
 			return true
 		}
 	}
 	return false
 }
 
-// maskIP returns ip with all bits after the first ones bits cleared, encoded
-// as a map key.
-func maskIP(ip net.IP, ones int) string {
-	buf := make([]byte, len(ip))
-	copy(buf, ip)
+// mask4 returns ip with all bits after the first ones bits cleared.
+func mask4(ip uint32, ones int) uint32 {
+	switch {
+	case ones <= 0:
+		return 0
+	case ones >= 32:
+		return ip
+	default:
+		return ip & (^uint32(0) << uint(32-ones))
+	}
+}
 
-	for i := range buf {
+// mask6 returns ip with all bits after the first ones bits cleared.
+func mask6(ip [16]byte, ones int) [16]byte {
+	masked := ip
+
+	for i := range masked {
 		remaining := ones - i*8
 		switch {
 		case remaining >= 8:
 			// Keep the whole byte.
 		case remaining <= 0:
-			buf[i] = 0
+			masked[i] = 0
 		default:
-			buf[i] &= byte(0xff << uint(8-remaining))
+			masked[i] &= byte(0xff << uint(8-remaining))
 		}
 	}
 
-	return string(buf)
+	return masked
 }
 
 // parseList parses a whitespace/comma separated threat list and returns the set
@@ -225,10 +242,18 @@ func parseList(body []byte) (*ipSet, int, int, error) {
 		}
 
 		lineValid := false
-		for _, field := range strings.FieldsFunc(line, isListSeparator) {
-			if addEntry(set, field) {
+		for start := 0; start < len(line); {
+			for start < len(line) && isListSeparator(line[start]) {
+				start++
+			}
+			end := start
+			for end < len(line) && !isListSeparator(line[end]) {
+				end++
+			}
+			if end > start && addEntry(set, line[start:end]) {
 				lineValid = true
 			}
+			start = end
 		}
 
 		if lineValid {
@@ -245,7 +270,7 @@ func parseList(body []byte) (*ipSet, int, int, error) {
 	return set, valid, invalid, nil
 }
 
-func isListSeparator(r rune) bool {
+func isListSeparator(r byte) bool {
 	switch r {
 	case ' ', '\t', '\r', '\v', '\f', ',', '|':
 		return true

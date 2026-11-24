@@ -2,6 +2,7 @@ package threatdb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"net"
@@ -118,13 +119,18 @@ func TestMaskIP(t *testing.T) {
 		if ip == nil {
 			t.Fatalf("could not parse %q", test.cidr)
 		}
+		var masked string
 		if v4 := ip.To4(); v4 != nil {
-			ip = v4
+			value := mask4(binary.BigEndian.Uint32(v4), test.ones)
+			masked = net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value)).String()
+		} else {
+			var raw [16]byte
+			copy(raw[:], ip.To16())
+			value := mask6(raw, test.ones)
+			masked = net.IP(value[:]).String()
 		}
-
-		masked := net.IP([]byte(maskIP(ip, test.ones))).String()
 		if masked != test.want {
-			t.Errorf("maskIP(%s, %d) = %s, want %s", test.cidr, test.ones, masked, test.want)
+			t.Errorf("mask(%s, %d) = %s, want %s", test.cidr, test.ones, masked, test.want)
 		}
 	}
 }
