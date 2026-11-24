@@ -1,6 +1,7 @@
 displayName: Threat DB
 type: middleware
 import: github.com/kallisti5/threatdb
+iconPath: icon.png
 
 summary: Block clients whose IP addresses appear on one or more remote threat lists.
 
