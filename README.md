@@ -10,7 +10,7 @@ Blocked clients get a friendly explanation instead of a bare 403.
 - Sends conditional requests (`If-None-Match` / `If-Modified-Since`) when the
   provider supports them.
 - Zero third-party dependencies, so it runs cleanly under Yaegi.
-- Optional JSON status endpoint for operations.
+- Optional status endpoint with JSON details and Prometheus metrics.
 
 > The lists are third-party data. Shared addresses (CGNAT, VPNs, cloud egress,
 > mobile carriers) occasionally appear on them, so keep an `allowList` ready and
@@ -123,7 +123,7 @@ See [`dev/`](dev/) for a ready-to-run Docker Compose setup.
 | `trustedProxyDepth` | int | `0` | Trust the last N hops of the forwarded header. `0` uses the TCP peer address. |
 | `forwardedForHeader` | string | `X-Forwarded-For` | Header used when `trustedProxyDepth > 0`. |
 | `failClosed` | bool | `false` | Return 503 while a list has never loaded instead of failing open. |
-| `statusPath` | string | *(disabled)* | Exact path that serves a JSON status document, bypassing blocking. |
+| `statusPath` | string | *(disabled)* | Exact path that serves a JSON status document or Prometheus metrics, bypassing blocking. |
 | `logBlockedRequests` | bool | `false` | Log each blocked request (can be noisy under attack). |
 | `userAgent` | string | `traefik-threatdb/<version>` | User-Agent sent to providers. |
 
@@ -260,7 +260,8 @@ only accepts traffic from Cloudflare.
 
 ## Status endpoint
 
-Set `statusPath` to a path that your application does not use. A `GET` returns:
+Set `statusPath` to a path that your application does not use. A `GET` returns
+a JSON snapshot by default:
 
 ```json
 {
@@ -269,6 +270,13 @@ Set `statusPath` to a path that your application does not use. A `GET` returns:
   "failClosed": false,
   "blockStatusCode": 403,
   "maxStaleSeconds": 86400,
+  "stats": {
+    "requests": 184233,
+    "allowed": 184220,
+    "rejectedMatches": 13,
+    "rejectedUnavailable": 0,
+    "noClientIP": 0
+  },
   "providers": [
     {
       "key": "threatlive",
@@ -278,6 +286,10 @@ Set `statusPath` to a path that your application does not use. A `GET` returns:
       "loaded": true,
       "stale": false,
       "fetching": false,
+      "matches": 13,
+      "refreshSuccesses": 96,
+      "refreshFailures": 0,
+      "lastRefreshSeconds": 0.21,
       "lastAttempt": "2026-11-23T16:20:03Z",
       "lastSuccess": "2026-11-23T16:20:03Z",
       "ageSeconds": 42,
@@ -287,9 +299,67 @@ Set `statusPath` to a path that your application does not use. A `GET` returns:
 }
 ```
 
+`stats.requests` counts requests evaluated by the middleware; the status path
+itself is not included. `rejectedMatches` is the total rejected because the
+client appeared on at least one list, and `rejectedUnavailable` counts
+`failClosed` rejections. Per-provider `matches` counts requests that matched
+that specific list, so one request can increment several providers.
+
 The endpoint bypasses the block logic so it can be checked from anywhere the
 router is reachable. Restrict it with a dedicated router, a Traefik IP allowlist,
 or by not exposing it publicly.
+
+### Prometheus metrics
+
+The same endpoint serves the Prometheus text exposition format when the client
+asks for it. Prometheus sends a suitable `Accept` header automatically, so just
+point a scrape job at `statusPath`:
+
+```yaml
+scrape_configs:
+  - job_name: threatdb
+    metrics_path: /_threatdb/status
+    static_configs:
+      - targets: ["traefik.example.com:8080"]
+```
+
+Requests with an `Accept: text/plain` or `Accept: application/openmetrics-text`
+header, or the explicit `?format=prometheus` query parameter, receive metrics.
+Everything else, including browsers and plain `curl`, keeps receiving JSON. If
+something in front of Traefik rewrites the `Accept` header, set
+`params: {format: [prometheus]}` in the scrape job instead.
+
+To inspect the metrics from a shell:
+
+```bash
+curl -s -H 'Accept: text/plain' http://localhost:8000/_threatdb/status
+# or
+curl -s 'http://localhost:8000/_threatdb/status?format=prometheus'
+```
+
+Exported metrics:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `threatdb_requests_total` | counter | Requests evaluated by the middleware. |
+| `threatdb_allowed_total` | counter | Requests forwarded to the next handler. |
+| `threatdb_rejected_total{reason}` | counter | Rejected requests, `reason="match"` or `"unavailable"`. |
+| `threatdb_no_client_ip_total` | counter | Requests forwarded because no client IP could be determined. |
+| `threatdb_info{middleware,version}` | gauge | Always `1`; identifies the middleware instance. |
+| `threatdb_provider_loaded{provider}` | gauge | `1` when a list has been loaded at least once. |
+| `threatdb_provider_stale{provider}` | gauge | `1` when the list is older than `maxStale`. |
+| `threatdb_provider_fetching{provider}` | gauge | `1` while a refresh is in progress. |
+| `threatdb_provider_entries{provider}` | gauge | Addresses and networks currently loaded. |
+| `threatdb_provider_matches_total{provider}` | counter | Requests rejected because they matched this provider. |
+| `threatdb_provider_refresh_total{provider,result}` | counter | Refresh attempts, `result="success"` or `"failure"`. |
+| `threatdb_provider_last_success_timestamp_seconds{provider}` | gauge | Unix time of the last successful refresh. |
+| `threatdb_provider_last_attempt_timestamp_seconds{provider}` | gauge | Unix time of the last refresh attempt. |
+| `threatdb_provider_last_refresh_duration_seconds{provider}` | gauge | Duration of the most recent refresh attempt. |
+
+`provider` labels are the configuration keys, not display names, so dashboards
+keep working if you rename a list. Timestamps are `0` until the first attempt or
+success. Useful alerts are `threatdb_provider_loaded == 0` (with
+`failClosed: true`) and `threatdb_provider_stale == 1`.
 
 ## Local development
 
@@ -306,8 +376,11 @@ curl -s http://localhost:8000/
 # Simulate a listed client (the dev config trusts X-Forwarded-For)
 curl -si http://localhost:8000/ -H 'X-Forwarded-For: 45.79.181.251'
 
-# Inspect the loaded lists
+# Inspect the loaded lists and request counters
 curl -s http://localhost:8000/_threatdb/status | jq .
+
+# Inspect the Prometheus metrics
+curl -s -H 'Accept: text/plain' http://localhost:8000/_threatdb/status
 ```
 
 The Traefik dashboard is available at <http://localhost:8080>.

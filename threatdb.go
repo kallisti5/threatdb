@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -111,8 +112,11 @@ type Config struct {
 	// lets requests through, which favours availability.
 	FailClosed bool `json:"failClosed,omitempty"`
 
-	// StatusPath, when set (e.g. "/threatdb/status"), serves a JSON snapshot
-	// of the loaded lists at that exact path, bypassing the block logic.
+	// StatusPath, when set (e.g. "/threatdb/status"), serves a snapshot of
+	// the loaded lists and request counters at that exact path, bypassing the
+	// block logic. The response is JSON by default and Prometheus text
+	// exposition when the client asks for it with an Accept header of
+	// text/plain or application/openmetrics-text, or with ?format=prometheus.
 	// Leave empty to disable. Make sure the path is not used by your
 	// application, and consider restricting it at the router level.
 	StatusPath string `json:"statusPath,omitempty"`
@@ -186,6 +190,35 @@ type options struct {
 	userAgent          string
 }
 
+// stats holds the request counters exposed by the status endpoint. Fields are
+// updated with sync/atomic so the request path does not take a lock.
+type stats struct {
+	requests            int64
+	allowed             int64
+	rejectedMatches     int64
+	rejectedUnavailable int64
+	noClientIP          int64
+}
+
+// statsSnapshot is a consistent-enough copy of the counters for rendering.
+type statsSnapshot struct {
+	Requests            int64 `json:"requests"`
+	Allowed             int64 `json:"allowed"`
+	RejectedMatches     int64 `json:"rejectedMatches"`
+	RejectedUnavailable int64 `json:"rejectedUnavailable"`
+	NoClientIP          int64 `json:"noClientIP"`
+}
+
+func (s *stats) snapshot() statsSnapshot {
+	return statsSnapshot{
+		Requests:            atomic.LoadInt64(&s.requests),
+		Allowed:             atomic.LoadInt64(&s.allowed),
+		RejectedMatches:     atomic.LoadInt64(&s.rejectedMatches),
+		RejectedUnavailable: atomic.LoadInt64(&s.rejectedUnavailable),
+		NoClientIP:          atomic.LoadInt64(&s.noClientIP),
+	}
+}
+
 // Middleware is the threat list blocking middleware.
 type Middleware struct {
 	next      http.Handler
@@ -194,6 +227,9 @@ type Middleware struct {
 	allow     *ipSet
 	providers []*providerCache
 	prefix    string
+	// stats is a pointer so its first 64-bit counter stays aligned for
+	// sync/atomic on 32-bit platforms.
+	stats *stats
 }
 
 // New creates the plugin.
@@ -230,6 +266,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		allow:     allow,
 		providers: providers,
 		prefix:    prefix,
+		stats:     &stats{},
 	}
 
 	// Load every list once before returning so that the middleware is ready
@@ -259,14 +296,18 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	atomic.AddInt64(&m.stats.requests, 1)
+
 	ip := clientIP(req, m.opts.forwardedHeader, m.opts.proxyDepth)
 	if ip == nil {
 		// Without an address we cannot make a decision; fail open.
+		atomic.AddInt64(&m.stats.noClientIP, 1)
 		m.next.ServeHTTP(rw, req)
 		return
 	}
 
 	if m.allow.contains(ip) || (m.opts.excludePrivate && isInternalIP(ip)) {
+		atomic.AddInt64(&m.stats.allowed, 1)
 		m.next.ServeHTTP(rw, req)
 		return
 	}
@@ -284,10 +325,12 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		if set.contains(ip) {
 			matches = append(matches, p.name)
+			atomic.AddInt64(&p.matches, 1)
 		}
 	}
 
 	if len(matches) > 0 {
+		atomic.AddInt64(&m.stats.rejectedMatches, 1)
 		provider := strings.Join(matches, ", ")
 		if m.opts.logBlocked {
 			logf(m.prefix, "blocked %s (matched %s) on %s %s", ip, provider, req.Method, req.URL.Path)
@@ -297,6 +340,7 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if len(missing) > 0 {
+		atomic.AddInt64(&m.stats.rejectedUnavailable, 1)
 		provider := strings.Join(missing, ", ")
 		if m.opts.logBlocked {
 			logf(m.prefix, "blocked %s (no list loaded: %s) on %s %s", ip, provider, req.Method, req.URL.Path)
@@ -305,6 +349,7 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	atomic.AddInt64(&m.stats.allowed, 1)
 	m.next.ServeHTTP(rw, req)
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,7 +18,14 @@ const (
 
 // providerCache owns the downloaded copy of a single threat list and keeps it
 // up to date in the background.
+//
+// The counter fields are accessed with sync/atomic and must stay at the top of
+// the struct so they remain 64-bit aligned on 32-bit platforms.
 type providerCache struct {
+	matches          int64
+	refreshSuccesses int64
+	refreshFailures  int64
+
 	key          string
 	name         string
 	url          string
@@ -39,6 +47,7 @@ type providerCache struct {
 	etag         string
 	lastModified string
 	fetching     bool
+	lastDuration time.Duration
 }
 
 // snapshot returns the current list and whether one has ever been loaded.
@@ -151,6 +160,7 @@ func (p *providerCache) refresh(ctx context.Context) bool {
 
 	p.mu.Lock()
 	p.fetching = false
+	p.lastDuration = elapsed
 	if err != nil {
 		p.lastErr = err.Error()
 	} else {
@@ -159,11 +169,14 @@ func (p *providerCache) refresh(ctx context.Context) bool {
 	p.mu.Unlock()
 
 	if err != nil {
+		atomic.AddInt64(&p.refreshFailures, 1)
 		if ctx.Err() == nil {
 			logerrf(p.logPrefix, "provider %q: refresh failed: %v", p.name, err)
 		}
 		return false
 	}
+
+	atomic.AddInt64(&p.refreshSuccesses, 1)
 
 	if notModified {
 		logf(p.logPrefix, "provider %q: list unchanged (HTTP 304, %s)", p.name, elapsed)
@@ -262,17 +275,24 @@ func (p *providerCache) fetch(ctx context.Context, etag, lastModified string) (i
 
 // providerStatus is the status endpoint representation of a provider.
 type providerStatus struct {
-	Key         string `json:"key"`
-	Name        string `json:"name"`
-	URL         string `json:"url"`
-	Entries     int    `json:"entries"`
-	Loaded      bool   `json:"loaded"`
-	Stale       bool   `json:"stale"`
-	Fetching    bool   `json:"fetching"`
-	LastAttempt string `json:"lastAttempt,omitempty"`
-	LastSuccess string `json:"lastSuccess,omitempty"`
-	AgeSeconds  int64  `json:"ageSeconds"`
-	LastError   string `json:"lastError,omitempty"`
+	Key                string  `json:"key"`
+	Name               string  `json:"name"`
+	URL                string  `json:"url"`
+	Entries            int     `json:"entries"`
+	Loaded             bool    `json:"loaded"`
+	Stale              bool    `json:"stale"`
+	Fetching           bool    `json:"fetching"`
+	Matches            int64   `json:"matches"`
+	RefreshSuccesses   int64   `json:"refreshSuccesses"`
+	RefreshFailures    int64   `json:"refreshFailures"`
+	LastRefreshSeconds float64 `json:"lastRefreshSeconds,omitempty"`
+	LastAttempt        string  `json:"lastAttempt,omitempty"`
+	LastSuccess        string  `json:"lastSuccess,omitempty"`
+	AgeSeconds         int64   `json:"ageSeconds"`
+	LastError          string  `json:"lastError,omitempty"`
+
+	lastAttemptUnix int64
+	lastSuccessUnix int64
 }
 
 func (p *providerCache) status(now time.Time, maxStale time.Duration) providerStatus {
@@ -280,20 +300,28 @@ func (p *providerCache) status(now time.Time, maxStale time.Duration) providerSt
 	defer p.mu.RUnlock()
 
 	status := providerStatus{
-		Key:       p.key,
-		Name:      p.name,
-		URL:       redactedURL(p.url),
-		Entries:   p.entries,
-		Loaded:    p.set != nil,
-		Fetching:  p.fetching,
-		LastError: p.lastErr,
+		Key:              p.key,
+		Name:             p.name,
+		URL:              redactedURL(p.url),
+		Entries:          p.entries,
+		Loaded:           p.set != nil,
+		Fetching:         p.fetching,
+		Matches:          atomic.LoadInt64(&p.matches),
+		RefreshSuccesses: atomic.LoadInt64(&p.refreshSuccesses),
+		RefreshFailures:  atomic.LoadInt64(&p.refreshFailures),
+		LastError:        p.lastErr,
 	}
 
+	if p.lastDuration > 0 {
+		status.LastRefreshSeconds = p.lastDuration.Seconds()
+	}
 	if !p.lastAttempt.IsZero() {
 		status.LastAttempt = p.lastAttempt.Format(time.RFC3339)
+		status.lastAttemptUnix = p.lastAttempt.Unix()
 	}
 	if !p.lastSuccess.IsZero() {
 		status.LastSuccess = p.lastSuccess.Format(time.RFC3339)
+		status.lastSuccessUnix = p.lastSuccess.Unix()
 		status.AgeSeconds = int64(now.Sub(p.lastSuccess).Seconds())
 	}
 
