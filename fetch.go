@@ -22,9 +22,14 @@ const (
 // The counter fields are accessed with sync/atomic and must stay at the top of
 // the struct so they remain 64-bit aligned on 32-bit platforms.
 type providerCache struct {
-	matches          int64
 	refreshSuccesses int64
 	refreshFailures  int64
+
+	id     string
+	ctx    context.Context
+	cancel context.CancelFunc
+	ready  chan struct{}
+	refs   int // guarded by sharedProvidersMu
 
 	key          string
 	name         string
@@ -58,20 +63,39 @@ func (p *providerCache) snapshot() (*ipSet, bool) {
 	return p.set, p.set != nil
 }
 
-// initialLoad downloads all lists once, in parallel. Failures are logged and
-// do not prevent the middleware from starting.
-func (m *Middleware) initialLoad(ctx context.Context) {
-	var wg sync.WaitGroup
+// run performs the first download, publishes readiness to every middleware
+// instance waiting on this cache, and then starts the refresh loop.
+func (p *providerCache) run() {
+	p.refresh(p.ctx)
+	close(p.ready)
+	p.loop(p.ctx)
+}
 
-	for _, provider := range m.providers {
-		wg.Add(1)
-		go func(p *providerCache) {
-			defer wg.Done()
-			p.refresh(ctx)
-		}(provider)
-	}
+// providerView is one middleware instance's handle to a shared provider cache.
+// The cache owns the parsed list and refresh state; the view adds the local
+// display name and per-instance match counter.
+type providerView struct {
+	matches int64
 
-	wg.Wait()
+	cache *providerCache
+	key   string
+	name  string
+}
+
+func (v *providerView) snapshot() (*ipSet, bool) {
+	return v.cache.snapshot()
+}
+
+func (v *providerView) refresh(ctx context.Context) bool {
+	return v.cache.refresh(ctx)
+}
+
+func (v *providerView) status(now time.Time, maxStale time.Duration) providerStatus {
+	status := v.cache.status(now, maxStale)
+	status.Key = v.key
+	status.Name = v.name
+	status.Matches = atomic.LoadInt64(&v.matches)
+	return status
 }
 
 // loop refreshes a list periodically, with exponential backoff while the
@@ -306,7 +330,6 @@ func (p *providerCache) status(now time.Time, maxStale time.Duration) providerSt
 		Entries:          p.entries,
 		Loaded:           p.set != nil,
 		Fetching:         p.fetching,
-		Matches:          atomic.LoadInt64(&p.matches),
 		RefreshSuccesses: atomic.LoadInt64(&p.refreshSuccesses),
 		RefreshFailures:  atomic.LoadInt64(&p.refreshFailures),
 		LastError:        p.lastErr,
@@ -328,6 +351,22 @@ func (p *providerCache) status(now time.Time, maxStale time.Duration) providerSt
 	status.Stale = !status.Loaded || (maxStale > 0 && now.Sub(p.lastSuccess) > maxStale)
 
 	return status
+}
+
+func newProviderCache(key, name string, settings providerShareSettings, logPrefix string) *providerCache {
+	return &providerCache{
+		key:          key,
+		name:         name,
+		url:          settings.url,
+		headers:      settings.headers,
+		interval:     settings.interval,
+		timeout:      settings.timeout,
+		minEntries:   settings.minEntries,
+		maxListBytes: settings.maxListBytes,
+		userAgent:    settings.userAgent,
+		logPrefix:    logPrefix,
+		client:       newHTTPClient(),
+	}
 }
 
 // logf writes an informational message. Traefik maps plugin stdout to its

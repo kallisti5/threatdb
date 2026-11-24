@@ -225,7 +225,7 @@ type Middleware struct {
 	name      string
 	opts      options
 	allow     *ipSet
-	providers []*providerCache
+	providers []*providerView
 	prefix    string
 	// stats is a pointer so its first 64-bit counter stays aligned for
 	// sync/atomic on 32-bit platforms.
@@ -269,21 +269,25 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		stats:     &stats{},
 	}
 
-	// Load every list once before returning so that the middleware is ready
-	// to make decisions as soon as Traefik starts serving traffic.
-	m.initialLoad(ctx)
-
+	// New caches have already started their first download in parallel.
+	// Wait for each one so the middleware is ready to make decisions as soon
+	// as Traefik starts serving traffic, while instances that share an
+	// already-loaded cache return immediately. If Traefik cancels the context
+	// during a reload or shutdown, stop waiting and let the release goroutine
+	// clean up; downloads keep running only while another instance shares them.
+waitLoop:
 	for _, p := range providers {
-		if p.interval <= 0 {
-			continue
+		select {
+		case <-p.cache.ready:
+		case <-ctx.Done():
+			break waitLoop
 		}
-		// Pass the provider as an argument instead of writing
-		// `go p.loop(ctx)`: Yaegi evaluates a method receiver on a range
-		// variable lazily, which would start every goroutine with the last
-		// provider in the slice and leave the other lists unrefreshed.
-		go func(provider *providerCache) {
-			provider.loop(ctx)
-		}(p)
+	}
+
+	// Traefik cancels this context when a new dynamic configuration is
+	// deployed. Release shared caches so removed providers stop refreshing.
+	if ctx.Done() != nil {
+		go m.releaseSharedProviders(ctx)
 	}
 
 	return m, nil
@@ -443,8 +447,10 @@ func parseOptions(config *Config) (*options, *ipSet, error) {
 	return opts, allow, nil
 }
 
-// buildProviders validates provider entries and creates their caches.
-func buildProviders(config *Config, opts *options, prefix string) ([]*providerCache, error) {
+// buildProviders validates provider entries and attaches each one to a shared
+// cache. Identical provider settings share one parsed list across all
+// middleware instances in the process.
+func buildProviders(config *Config, opts *options, prefix string) ([]*providerView, error) {
 	if len(config.Providers) == 0 {
 		return nil, fmt.Errorf("at least one entry in providers is required")
 	}
@@ -455,7 +461,7 @@ func buildProviders(config *Config, opts *options, prefix string) ([]*providerCa
 	}
 	sort.Strings(keys)
 
-	providers := make([]*providerCache, 0, len(keys))
+	plans := make([]providerPlan, 0, len(keys))
 	names := make(map[string]string, len(keys))
 
 	for _, key := range keys {
@@ -502,18 +508,29 @@ func buildProviders(config *Config, opts *options, prefix string) ([]*providerCa
 			maxListBytes = provider.MaxListBytes
 		}
 
-		providers = append(providers, &providerCache{
-			key:          key,
-			name:         name,
-			url:          rawURL,
-			headers:      copyHeaders(provider.Headers),
-			interval:     interval,
-			timeout:      opts.requestTimeout,
-			minEntries:   provider.MinEntries,
-			maxListBytes: maxListBytes,
-			userAgent:    opts.userAgent,
-			logPrefix:    prefix,
-			client:       newHTTPClient(),
+		plans = append(plans, providerPlan{
+			key:  key,
+			name: name,
+			settings: providerShareSettings{
+				url:          rawURL,
+				headers:      copyHeaders(provider.Headers),
+				interval:     interval,
+				timeout:      opts.requestTimeout,
+				minEntries:   provider.MinEntries,
+				maxListBytes: maxListBytes,
+				userAgent:    opts.userAgent,
+			},
+		})
+	}
+
+	providers := make([]*providerView, 0, len(plans))
+	for _, plan := range plans {
+		candidate := newProviderCache(plan.key, plan.name, plan.settings, prefix)
+		cache := acquireSharedProvider(plan.settings.key(), candidate)
+		providers = append(providers, &providerView{
+			cache: cache,
+			key:   plan.key,
+			name:  plan.name,
 		})
 	}
 

@@ -10,6 +10,8 @@ Blocked clients get a friendly explanation instead of a bare 403.
 - Sends conditional requests (`If-None-Match` / `If-Modified-Since`) when the
   provider supports them.
 - Zero third-party dependencies, so it runs cleanly under Yaegi.
+- Parses each list once and shares it across middleware instances with the same
+  provider settings.
 - Optional status endpoint with JSON details and Prometheus metrics.
 
 > The lists are third-party data. Shared addresses (CGNAT, VPNs, cloud egress,
@@ -303,7 +305,9 @@ a JSON snapshot by default:
 itself is not included. `rejectedMatches` is the total rejected because the
 client appeared on at least one list, and `rejectedUnavailable` counts
 `failClosed` rejections. Per-provider `matches` counts requests that matched
-that specific list, so one request can increment several providers.
+that specific list, so one request can increment several providers. Match
+counters are per middleware instance; refresh counters and list state describe
+the shared provider cache.
 
 The endpoint bypasses the block logic so it can be checked from anywhere the
 router is reachable. Restrict it with a dedicated router, a Traefik IP allowlist,
@@ -401,8 +405,8 @@ make bench         # set lookup benchmark
 
 The test suite covers list parsing, IPv4/IPv6/CIDR matching, client IP
 extraction, scheduling and refresh, conditional requests, stale-data retention,
-configuration validation, the status endpoint, and concurrent traffic during
-refreshes.
+configuration validation, shared provider caches, the status endpoint, and
+concurrent traffic during refreshes.
 
 ## Publishing to the Traefik plugin catalog
 
@@ -437,14 +441,22 @@ after a couple of days.
 
 ## Operational notes
 
-- **One instance per router:** Traefik constructs a middleware instance for
-  every router that references it. Each instance holds its own parsed copy of
-  every list and runs its own refresh goroutines, so ten routers means ten
-  copies and ten downloads per interval. With the sample 47k-entry list the
-  parsed copy is about 1 MiB, so this is usually only a bandwidth and start-up
-  cost, but keep the number of routers referencing the middleware in mind.
-- **Memory:** about 1 MiB per 47k addresses (roughly 2 MB per 100k entries),
-  plus the response body during parsing (bounded by `maxListBytes`).
+- **Shared lists:** Traefik constructs a middleware instance for every router
+  that references the plugin, but instances with identical provider settings
+  share one parsed copy and one refresh loop. Ten routers using the same
+  middleware definition download once per interval and store the list once. The
+  shared copy is kept for a short grace period after a dynamic-configuration
+  reload so the replacement instances attach without re-downloading. Different
+  `url`, `headers`, `refreshInterval`, `requestTimeout`, `minEntries`,
+  `maxListBytes` or `userAgent` values produce separate caches. Sharing happens
+  within one plugin definition (one Yaegi interpreter in the Traefik process),
+  which covers the usual setup where every router references the same
+  `threatdb` plugin.
+- **Memory:** one parsed copy per distinct provider configuration, plus the
+  response body during parsing (bounded by `maxListBytes`). Exact IPv4 entries
+  cost tens of bytes each after overhead; for example 800k exact addresses
+  retained roughly 45 MiB in testing. During a refresh the old and new copies
+  briefly coexist.
 - **Use HTTPS for providers:** `http://` URLs are accepted for local or
   private lists, but a cleartext response can be modified in transit and
   inject or remove addresses.
